@@ -1,5 +1,9 @@
 # Data
 data/cleaned_data.csv
+data/cleaned_data_NA_included.csv
+
+# Raw DHS Files
+data/Unzip Files/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
