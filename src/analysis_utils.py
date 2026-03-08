@@ -7,7 +7,7 @@ Includes:
 - Data subsetting and cleaning
 - Vaccination recoding
 - Weighted chi-square + Cramer's V
-- Weighted logistic regression (survey weights via statsmodels GLM)
+- Weighted logistic regression (survey weights via R svyglm)
 - Weighted ordinal logistic regression (survey weights via R svyolr)
 - Odds ratio extraction
 - Reusable visualization helpers
@@ -22,7 +22,7 @@ import numpy as np
 
 from typing import List, Tuple, Optional
 
-from scipy.stats import chi2_contingency
+from scipy.stats import chi2_contingency, norm
 
 import statsmodels.api as sm
 from statsmodels.miscmodels.ordinal_model import OrderedModel
@@ -155,57 +155,96 @@ def screen_categorical_associations(
 def fit_weighted_logit(
     df: pd.DataFrame,
     formula: str,
-    weight_col: str
+    weight_col: str = "wt"
 ):
     """
-    Fit survey-weighted binary logistic regression using statsmodels GLM.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-    formula : str
-        Patsy formula string, e.g. 'y ~ x1 + C(x2)'
-    weight_col : str
-        Column name of survey/sampling weights.
+    Fit survey-weighted binary logistic regression using R's svyglm.
 
     Returns
     -------
-    statsmodels GLMResultsWrapper
+    tuple: (or_df, fit_stats)
+        or_df: DataFrame with OR, CI, t_value, p_value
+        fit_stats: dict with n, log_likelihood, null_log_likelihood, mcfadden_r2, aic, bic
     """
-    model = sm.GLM.from_formula(
-        formula,
-        data=df,
-        family=sm.families.Binomial(),
-        freq_weights=df[weight_col]
-    )
-    return model.fit()
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.packages import importr
+    from rpy2.robjects.conversion import localconverter
+
+    base = importr("base")
+    importr("survey")
+
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        r_df = ro.conversion.py2rpy(df)
+
+    ro.globalenv["r_df"] = r_df
+    ro.globalenv["formula_str"] = formula
+    ro.globalenv["weight_col"] = weight_col
+
+    ro.r("""
+        library(survey)
+        r_df[[weight_col]] <- as.numeric(r_df[[weight_col]])
+        design <- svydesign(ids = ~1, weights = as.formula(paste0("~", weight_col)), data = r_df)
+        model <- svyglm(as.formula(formula_str), design = design, family = quasibinomial())
+        coefs <- coef(summary(model))
+
+        ll <- model$deviance / -2
+        null_formula <- as.formula(paste(strsplit(formula_str, "~")[[1]][1], "~ 1"))
+        null_model <- svyglm(null_formula, design = design, family = quasibinomial())
+        ll_null <- null_model$deviance / -2
+        n_obs <- as.numeric(nrow(design$variables))
+        aic_val <- AIC(model)["AIC"]
+        k_params <- length(coef(model))
+        bic_val <- -2 * ll + k_params * log(n_obs)
+    """)
+
+    # --- ORs ---
+    coefs = ro.globalenv["coefs"]
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        coefs_df = ro.conversion.rpy2py(base.as_data_frame(coefs))
+
+    coefs_df.columns = ["coef", "Std_Error", "t_value", "p_value"]
+    coefs_df["OR"] = np.exp(coefs_df["coef"])
+    coefs_df["CI_lower"] = np.exp(coefs_df["coef"] - 1.96 * coefs_df["Std_Error"])
+    coefs_df["CI_upper"] = np.exp(coefs_df["coef"] + 1.96 * coefs_df["Std_Error"])
+    or_df = coefs_df[["OR", "CI_lower", "CI_upper", "t_value", "p_value"]]
+
+    # --- Fit stats ---
+    ll = float(ro.r("as.numeric(ll)")[0])
+    ll_null = float(ro.r("as.numeric(ll_null)")[0])
+    n = int(ro.r("n_obs")[0])
+    aic = float(ro.r("as.numeric(aic_val)")[0])
+    bic = float(ro.r("bic_val")[0])
+
+    fit_stats = {
+        "n": n,
+        "log_likelihood": ll,
+        "null_log_likelihood": ll_null,
+        "mcfadden_r2": 1 - (ll / ll_null),
+        "aic": aic,
+        "bic": bic
+    }
+
+    return or_df, fit_stats
 
 
 def fit_weighted_ordinal_logit(
     df: pd.DataFrame,
     outcome: str,
     predictors: List[str],
-    weight_col: str
+    weight_col: str = "wt"
 ):
     """
     Fit survey-weighted ordinal logistic regression via R's svyolr.
 
-    Requires rpy2 and the R 'survey' package to be installed.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-    outcome : str
-        Column name of the ordinal outcome variable.
-    predictors : list of str
-        Column names of predictors.
-    weight_col : str
-        Column name of survey/sampling weights.
+    p-values are computed from t-values using a normal approximation,
+    consistent with the asymptotic normality assumption used by svyolr.
 
     Returns
     -------
-    pd.DataFrame
-        Odds ratios with 95% CI and p-values.
+    tuple: (or_df, fit_stats)
+        or_df: DataFrame with OR, CI, t_value, p_value
+        fit_stats: dict with n, log_likelihood, null_log_likelihood, mcfadden_r2, aic, bic
     """
     import rpy2.robjects as ro
     from rpy2.robjects import pandas2ri
@@ -215,21 +254,15 @@ def fit_weighted_ordinal_logit(
     survey = importr("survey")
     base = importr("base")
 
-    # Transfer dataframe to R using modern conversion context
     with localconverter(ro.default_converter + pandas2ri.converter):
         r_df = ro.conversion.py2rpy(df)
 
     ro.globalenv["r_df"] = r_df
-
-    # Build formula string
     formula_str = f"{outcome} ~ {' + '.join(predictors)}"
     ro.globalenv["formula_str"] = formula_str
     ro.globalenv["weight_col"] = weight_col
-
-    # Pass outcome column name to R
     ro.globalenv["outcome_col"] = outcome
 
-    # Run svyolr in R
     ro.r("""
         library(survey)
         r_df[[outcome_col]] <- as.factor(r_df[[outcome_col]])
@@ -237,19 +270,49 @@ def fit_weighted_ordinal_logit(
         design <- svydesign(ids = ~1, weights = as.formula(paste0("~", weight_col)), data = r_df)
         model <- svyolr(as.formula(formula_str), design = design)
         coefs <- coef(summary(model))
+
+        ll <- model$deviance / -2
+        null_model <- svyolr(as.formula(paste(outcome_col, "~ 1")), design = design)
+        ll_null <- null_model$deviance / -2
+        n_obs <- as.numeric(nrow(design$variables))
+        k_params <- length(coef(model))
+        aic_val <- -2 * ll + 2 * k_params
+        bic_val <- -2 * ll + k_params * log(n_obs)
     """)
 
-    # Pull results back to Python
+    # --- ORs ---
     coefs = ro.globalenv["coefs"]
     with localconverter(ro.default_converter + pandas2ri.converter):
         coefs_df = ro.conversion.rpy2py(base.as_data_frame(coefs))
 
     coefs_df.columns = ["coef", "Std_Error", "t_value"]
+
+    # Compute p-values from t-values using normal approximation
+    # (consistent with svyolr's asymptotic normality assumption)
+    coefs_df["p_value"] = 2 * (1 - norm.cdf(np.abs(coefs_df["t_value"])))
+
     coefs_df["OR"] = np.exp(coefs_df["coef"])
     coefs_df["CI_lower"] = np.exp(coefs_df["coef"] - 1.96 * coefs_df["Std_Error"])
     coefs_df["CI_upper"] = np.exp(coefs_df["coef"] + 1.96 * coefs_df["Std_Error"])
+    or_df = coefs_df[["OR", "CI_lower", "CI_upper", "t_value", "p_value"]]
 
-    return coefs_df[["OR", "CI_lower", "CI_upper", "t_value"]]
+    # --- Fit stats ---
+    ll = float(ro.r("as.numeric(ll)")[0])
+    ll_null = float(ro.r("as.numeric(ll_null)")[0])
+    n = int(ro.r("n_obs")[0])
+    aic = float(ro.r("aic_val")[0])
+    bic = float(ro.r("bic_val")[0])
+
+    fit_stats = {
+        "n": n,
+        "log_likelihood": ll,
+        "null_log_likelihood": ll_null,
+        "mcfadden_r2": 1 - (ll / ll_null),
+        "aic": aic,
+        "bic": bic
+    }
+
+    return or_df, fit_stats
 
 
 # ============================================================
@@ -290,20 +353,35 @@ def plot_heatmap(table: pd.DataFrame, title: str = ""):
 
 
 def plot_odds_ratios(or_df: pd.DataFrame, title: str = ""):
-    """Plot odds ratios with confidence intervals."""
+    """
+    Plot odds ratios with confidence intervals.
+    Points are coloured by significance if a p_value column is present:
+        - p < 0.05: #2c7bb6 (blue)
+        - p >= 0.05: #ababab (grey)
+    """
     import matplotlib.pyplot as plt
 
-    df = or_df.copy()
-    df = df.dropna()
+    df = or_df.copy().dropna(subset=["OR", "CI_lower", "CI_upper"])
+
+    if "p_value" in df.columns:
+        colors = ["#2c7bb6" if p < 0.05 else "#ababab" for p in df["p_value"]]
+    else:
+        colors = ["#2c7bb6"] * len(df)
 
     plt.figure(figsize=(8, 6))
-    plt.errorbar(
-        df["OR"],
-        df.index,
-        xerr=[df["OR"] - df["CI_lower"], df["CI_upper"] - df["OR"]],
-        fmt="o"
-    )
-    plt.axvline(1, linestyle="--")
+    for i, (idx, row) in enumerate(df.iterrows()):
+        plt.scatter(row["OR"], i, color=colors[i], s=120, zorder=3)
+        plt.hlines(
+            i,
+            row["CI_lower"],
+            row["CI_upper"],
+            colors=colors[i],
+            lw=2.5,
+            zorder=2
+        )
+
+    plt.axvline(1, linestyle="--", color="#d62728", linewidth=1.5, alpha=0.7)
+    plt.yticks(range(len(df)), df.index)
     plt.title(title)
     plt.xlabel("Odds Ratio")
     plt.tight_layout()
